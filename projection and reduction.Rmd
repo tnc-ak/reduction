@@ -1,0 +1,204 @@
+# ============================================================
+# Objective 3 — Statistical BAU Projection + Mitigation (AK)
+# EPA SIT (1990–2022) -> Project to 2030 per sector
+# Reductions: Industry -15%, Transportation -20%
+# Author: Your Name | Date: YYYY-MM-DD
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(zoo)      # for moving average logic if needed elsewhere
+  library(scales)   # nice axis labels
+})
+
+# ---------------------------
+# 0) Paths & Parameters
+# ---------------------------
+DATA_FILE    <- "data/epa_sit_alaska_1990_2022.csv"  # columns: Year, Sector, Emissions
+OUT_DIR      <- "output"
+PLOT_DIR     <- file.path(OUT_DIR, "plots")
+
+start_proj   <- 2023
+end_proj     <- 2030
+r2_threshold <- 0.70   # use linear model if R^2 >= this
+ma_window    <- 5      # 2018–2022 average for irregular sectors
+
+# Mitigation targets by 2030
+targets <- tibble(
+  Sector     = c("Industry", "Transportation"),
+  target_pct = c(0.15,       0.20)     # 15% and 20%
+)
+
+# Reduction application mode:
+#   "linear_to_2030": ramp from 0% at start_proj to full target at 2030
+#   "immediate": apply full target from start_proj onward
+reduction_mode <- "linear_to_2030"
+
+# ---------------------------
+# 1) Load & Tidy Input
+# ---------------------------
+stopifnot(file.exists(DATA_FILE))
+
+epa_raw <- read_csv(DATA_FILE, show_col_types = FALSE)
+# Make column names robust to case variations
+names(epa_raw) <- tolower(names(epa_raw))
+
+# Expect these after lower-casing:
+# year, sector, emissions
+stopifnot(all(c("year","sector","emissions") %in% names(epa_raw)))
+
+epa <- epa_raw %>%
+  transmute(
+    year      = as.integer(year),
+    sector    = as.character(sector),
+    emissions = as.numeric(emissions)
+  ) %>%
+  filter(!is.na(year), !is.na(sector), !is.na(emissions)) %>%
+  arrange(sector, year)
+
+# ---------------------------
+# 2) BAU Projection Function
+# ---------------------------
+project_sector <- function(df_sector, r2_cut = 0.70, ma_years = 5) {
+  # df_sector: year, sector, emissions (historical through 2022)
+  stopifnot(all(c("year","sector","emissions") %in% names(df_sector)))
+  this_sector <- unique(df_sector$sector)
+
+  # Fit simple linear regression
+  lm_fit <- lm(emissions ~ year, data = df_sector)
+  r2     <- summary(lm_fit)$r.squared
+
+  proj_years <- tibble(year = seq(start_proj, end_proj, 1))
+
+  if (is.finite(r2) && r2 >= r2_cut) {
+    # Use linear regression for consistent pattern
+    preds  <- predict(lm_fit, newdata = proj_years)
+    method <- "Linear Regression"
+  } else {
+    # Use last 5-year average (2018–2022) for irregular pattern
+    last_hist_year <- max(df_sector$year, na.rm = TRUE)
+    window_start   <- last_hist_year - (ma_years - 1)
+    recent_df <- df_sector %>% filter(year >= window_start)
+    recent_avg <- mean(recent_df$emissions, na.rm = TRUE)
+    preds  <- rep(recent_avg, nrow(proj_years))
+    method <- sprintf("Moving Average (%d yrs)", ma_years)
+  }
+
+  # Bind historical + projections
+  bind_rows(
+    df_sector %>% mutate(Method = "Historical", R2 = NA_real_),
+    proj_years %>% mutate(
+      sector    = this_sector,
+      emissions = as.numeric(preds),
+      Method    = method,
+      R2        = r2
+    )
+  ) %>% arrange(year)
+}
+
+# ---------------------------
+# 3) Build BAU (per sector)
+# ---------------------------
+bau <- epa %>%
+  group_by(sector) %>%
+  group_modify(~ project_sector(.x, r2_cut = r2_threshold, ma_years = ma_window)) %>%
+  ungroup() %>%
+  arrange(sector, year)
+
+# ---------------------------
+# 4) Apply Mitigation Scenarios
+# ---------------------------
+# Merge targets with BAU records
+bau_mit <- bau %>%
+  left_join(targets, by = "sector") %>%
+  mutate(target_pct = replace_na(target_pct, 0))  # sectors without targets -> 0
+
+# Year-specific adjustment factors
+bau_mit <- bau_mit %>%
+  mutate(
+    years_from_start = pmax(0, year - start_proj),
+    years_to_target  = max(1, end_proj - start_proj),  # avoid divide-by-zero
+    ramp_fraction    = pmin(1, years_from_start / years_to_target),
+    AdjFactor = case_when(
+      Method == "Historical"                 ~ 1.0,
+      reduction_mode == "immediate"          ~ 1.0 - target_pct,
+      reduction_mode == "linear_to_2030"     ~ 1.0 - target_pct * ramp_fraction,
+      TRUE                                   ~ 1.0
+    )
+  )
+
+# Scenario table (BAU vs Mitigation)
+bau_only <- bau %>%
+  mutate(Scenario = "BAU") %>%
+  select(sector, year, Scenario, Method, Emissions = emissions, R2)
+
+mitig <- bau_mit %>%
+  filter(!(Method == "Historical")) %>%
+  mutate(Scenario = paste0("Mitigation_", reduction_mode),
+         Emissions = emissions * AdjFactor) %>%
+  select(sector, year, Scenario, Method, Emissions, R2)
+
+scenarios_all <- bind_rows(bau_only, mitig) %>%
+  arrange(sector, year, Scenario)
+
+# ---------------------------
+# 5) Save Outputs
+# ---------------------------
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(PLOT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+write_csv(bau,          file.path(OUT_DIR, "alaska_ghg_bau_by_sector.csv"))
+write_csv(scenarios_all,file.path(OUT_DIR, "alaska_ghg_scenarios_by_sector.csv"))
+
+# ---------------------------
+# 6) Plots
+# ---------------------------
+# BAU facets (historical + BAU)
+p_bau <- ggplot(bau, aes(x = year, y = emissions, color = Method, linetype = Method)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ sector, scales = "free_y") +
+  labs(
+    title   = "Alaska GHG Emissions — Historical & BAU (Statistical)",
+    x       = "Year",
+    y       = "Emissions (MMT CO\u2082e)",
+    caption = "BAU uses Linear Regression (R^2 ≥ threshold) or 5-yr Moving Average (2018–2022)."
+  ) +
+  theme_minimal()
+ggsave(file.path(PLOT_DIR, "bau_facets.png"), p_bau, width = 12, height = 8, dpi = 300)
+
+# BAU vs Mitigation (sector facets)
+p_mit <- scenarios_all %>%
+  filter(Scenario %in% c("BAU", paste0("Mitigation_", reduction_mode))) %>%
+  ggplot(aes(x = year, y = Emissions, color = Scenario, linetype = Scenario)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ sector, scales = "free_y") +
+  labs(
+    title   = "BAU vs Mitigation (Sectoral) — Alaska GHG",
+    x       = "Year",
+    y       = "Emissions (MMT CO\u2082e)",
+    caption = "Mitigation applies sector-specific targets (Industry 15%, Transportation 20%)."
+  ) +
+  theme_minimal()
+ggsave(file.path(PLOT_DIR, "bau_vs_mitigation_facets.png"), p_mit, width = 12, height = 8, dpi = 300)
+
+# Statewide totals (BAU vs Mitigation)
+totals <- scenarios_all %>%
+  group_by(year, Scenario) %>%
+  summarise(Total = sum(Emissions, na.rm = TRUE), .groups = "drop")
+
+p_total <- totals %>%
+  filter(Scenario %in% c("BAU", paste0("Mitigation_", reduction_mode))) %>%
+  ggplot(aes(x = year, y = Total, color = Scenario)) +
+  geom_line(linewidth = 1.2) +
+  geom_point() +
+  labs(
+    title   = "Statewide Total Emissions — BAU vs Mitigation",
+    x       = "Year",
+    y       = "Total Emissions (MMT CO\u2082e)",
+    caption = paste0("Reductions = ", paste(paste0(targets$Sector, ": ", targets$target_pct*100, "%"), collapse = "; "),
+                     ". Mode: ", reduction_mode, ".")
+  ) +
+  theme_minimal()
+ggsave(file.path(PLOT_DIR, "total_bau_vs_mitigation.png"), p_total, width = 10, height = 6, dpi = 300)
+
+message("Done. CSVs in '", OUT_DIR, "', plots in '", PLOT_DIR, "'.")
